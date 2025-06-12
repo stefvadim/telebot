@@ -5,7 +5,7 @@ from telegram import Update
 from collections import defaultdict
 from datetime import datetime, timedelta
 
-TOKEN = "7854667217:AAEpFQNVBPR_E-eFVy_I6dVXXmVOzs7bitg"
+TOKEN = "7854667217:AAEpFQNVBPR_E-eFVy_I6dVXXmVOzs7bitg"  # НЕ коммить сюда настоящий токен!
 
 join_times = defaultdict(dict)
 rating = defaultdict(lambda: defaultdict(int))
@@ -51,8 +51,8 @@ async def count_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     rating[chat_id][user_id] += 1
 
-async def weekly_awards(context: ContextTypes.DEFAULT_TYPE):
-    bot = context.bot
+async def weekly_awards(app):
+    bot = app.bot
     for chat_id, users_scores in rating.items():
         sorted_scores = sorted(users_scores.items(), key=lambda x: x[1], reverse=True)
         last_week_winners[chat_id] = sorted_scores[:5]
@@ -85,8 +85,7 @@ async def main():
     app.add_handler(CommandHandler("id", cmd_id))
 
     scheduler = AsyncIOScheduler()
-    # Передаем контекст app как context для задания
-    scheduler.add_job(weekly_awards, "cron", day_of_week="mon", hour=0, minute=0, kwargs={"context": app})
+    scheduler.add_job(weekly_awards, "cron", day_of_week="mon", hour=0, minute=0, args=[app])
     scheduler.start()
 
     await app.run_polling()
