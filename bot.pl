@@ -85,14 +85,11 @@ async def main():
     app.add_handler(CommandHandler("id", cmd_id))
 
     scheduler = AsyncIOScheduler()
-    scheduler.add_job(weekly_awards, "cron", day_of_week="mon", hour=0, minute=0, args=[app.job_queue])
+    # Передаем контекст app как context для задания
+    scheduler.add_job(weekly_awards, "cron", day_of_week="mon", hour=0, minute=0, kwargs={"context": app})
     scheduler.start()
 
-    # Запускаем polling без asyncio.run, чтобы не создавать конфликт с loop
     await app.run_polling()
 
 if __name__ == "__main__":
-    # Запуск без asyncio.run()
-    import asyncio
-    loop = asyncio.get_event_loop()
-    loop.run_until_complete(main())
+    asyncio.run(main())
