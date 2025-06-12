@@ -3,7 +3,7 @@ services:
     name: telegram-bot
     env: python
     buildCommand: ""
-    startCommand: python bot.py
+    startCommand: python bot.pl
     envVars:
       - key: BOT_TOKEN
         value: 7854667217:AAEpFQNVBPR_E-eFVy_I6dVXXmVOzs7bitg
