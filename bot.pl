@@ -49,7 +49,7 @@ async def top_scores(update: Update, context: ContextTypes.DEFAULT_TYPE):
 if __name__ == "__main__":
     app = ApplicationBuilder().token(TOKEN).build()
 
-    app.add_handler(CommandHandler("топ", top_scores))
+    app.add_handler(CommandHandler("top", top_scores))
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
 
     print("Бот запущен.")
