@@ -11,29 +11,22 @@ join_times = defaultdict(dict)
 rating = defaultdict(lambda: defaultdict(int))
 last_week_winners = defaultdict(list)
 
-# (Здесь ваши хэндлеры welcome, check_media_restriction, count_message, weekly_awards, cmd_id)
-
-
 async def welcome(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for member in update.message.new_chat_members:
         chat_id = update.effective_chat.id
         user_id = member.id
         join_times[chat_id][user_id] = datetime.utcnow()
-
         msg = await update.effective_chat.send_message(
-            f"Добро пожаловать, {member.mention_html()}!\n"
-            "В первые 24 часа нельзя отправлять фото, видео и ссылки.",
+            f"Добро пожаловать, {member.mention_html()}!\nВ первые 24 часа нельзя отправлять фото, видео и ссылки.",
             parse_mode="HTML",
         )
         await asyncio.sleep(10)
         await msg.delete()
 
-
 async def check_media_restriction(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     chat_id = update.effective_chat.id
     user_id = user.id
-
     if user_id in join_times[chat_id]:
         join_time = join_times[chat_id][user_id]
         if datetime.utcnow() - join_time < timedelta(hours=24):
@@ -52,12 +45,10 @@ async def check_media_restriction(update: Update, context: ContextTypes.DEFAULT_
                 except:
                     pass
 
-
 async def count_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     chat_id = update.effective_chat.id
     rating[chat_id][user_id] += 1
-
 
 async def weekly_awards(context: ContextTypes.DEFAULT_TYPE):
     bot = context.bot
@@ -80,13 +71,18 @@ async def weekly_awards(context: ContextTypes.DEFAULT_TYPE):
 
         rating[chat_id].clear()
 
-
 async def cmd_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     await update.message.reply_text(f"ID этого чата: {chat_id}")
 
+async def start_scheduler(app):
+    scheduler = AsyncIOScheduler()
+    # Передаем контекст с ботом через app.job_queue
+    scheduler.add_job(weekly_awards, "cron", day_of_week="mon", hour=0, minute=0, args=[app.job_queue])
+    scheduler.start()
+    print("Scheduler started")
 
-def main():
+async def main():
     app = ApplicationBuilder().token(TOKEN).build()
 
     app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, welcome))
@@ -94,12 +90,10 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & (~filters.StatusUpdate.NEW_CHAT_MEMBERS), count_message))
     app.add_handler(CommandHandler("id", cmd_id))
 
-    scheduler = AsyncIOScheduler()
-    scheduler.add_job(weekly_awards, "cron", day_of_week="mon", hour=0, minute=0, args=[app.job_queue])
-    scheduler.start()
+    # Запускаем планировщик после запуска event loop
+    asyncio.create_task(start_scheduler(app))
 
-    app.run_polling()  # Запускает свой event loop
-
+    await app.run_polling()
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
