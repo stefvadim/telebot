@@ -1,22 +1,17 @@
 import asyncio
-from datetime import datetime, timedelta
-from collections import defaultdict
-
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
 from telegram import Update
-from telegram.ext import (
-    ApplicationBuilder,
-    CommandHandler,
-    MessageHandler,
-    ContextTypes,
-    filters,
-)
+from collections import defaultdict
+from datetime import datetime, timedelta
 
 TOKEN = "7854667217:AAEpFQNVBPR_E-eFVy_I6dVXXmVOzs7bitg"
 
-join_times = defaultdict(dict)  # {chat_id: {user_id: join_datetime}}
-rating = defaultdict(lambda: defaultdict(int))  # {chat_id: {user_id: msg_count}}
-last_week_winners = defaultdict(list)  # {chat_id: [(user_id, score), ...]}
+join_times = defaultdict(dict)
+rating = defaultdict(lambda: defaultdict(int))
+last_week_winners = defaultdict(list)
+
+# (Здесь ваши хэндлеры welcome, check_media_restriction, count_message, weekly_awards, cmd_id)
 
 
 async def welcome(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -91,7 +86,7 @@ async def cmd_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"ID этого чата: {chat_id}")
 
 
-async def main():
+def main():
     app = ApplicationBuilder().token(TOKEN).build()
 
     app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, welcome))
@@ -100,12 +95,11 @@ async def main():
     app.add_handler(CommandHandler("id", cmd_id))
 
     scheduler = AsyncIOScheduler()
-    # Запускаем по понедельникам в 00:00
     scheduler.add_job(weekly_awards, "cron", day_of_week="mon", hour=0, minute=0, args=[app.job_queue])
     scheduler.start()
 
-    await app.run_polling()
+    app.run_polling()  # Запускает свой event loop
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
