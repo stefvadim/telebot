@@ -1,51 +1,56 @@
-import re
-import asyncio
-from datetime import datetime, timedelta
-from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
-
 import os
+import json
+from collections import defaultdict
+from telegram import Update
+from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
+
+# Загрузка токена
 TOKEN = os.getenv("BOT_TOKEN")
 
-new_users = {}
+# Файл с рейтингами
+SCORE_FILE = "scores.json"
 
-async def welcome(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    for member in update.message.new_chat_members:
-        new_users[member.id] = datetime.utcnow()
-        msg = await update.message.reply_text(
-            f"Привет, {member.full_name}! В течение 24 часов нельзя отправлять фото, видео и ссылки."
-        )
-        await asyncio.sleep(10)
-        try:
-            await msg.delete()
-        except:
-            pass
+# Загружаем баллы из файла
+if os.path.exists(SCORE_FILE):
+    with open(SCORE_FILE, "r", encoding="utf-8") as f:
+        scores = json.load(f)
+else:
+    scores = {}
 
-async def restrict_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.message.from_user.id
-    now = datetime.utcnow()
+# Функция сохранения баллов в файл
+def save_scores():
+    with open(SCORE_FILE, "w", encoding="utf-8") as f:
+        json.dump(scores, f)
 
-    if user_id in new_users and (now - new_users[user_id]) < timedelta(hours=24):
-        has_media = bool(update.message.photo) or bool(update.message.video) or bool(update.message.document)
-        text = update.message.text or ''
-        has_link = bool(re.search(r'https?://|t\.me/|www\.', text))
-        if has_media or has_link:
-            try:
-                await update.message.delete()
-                await update.message.reply_text(
-                    f"{update.message.from_user.first_name}, первые 24 часа нельзя отправлять фото, видео и ссылки."
-                )
-            except:
-                pass
+# Обработка сообщений (начисление очков)
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.message.from_user
+    user_id = str(user.id)
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Бот работает.")
+    # Начисляем балл за каждое сообщение
+    if user_id not in scores:
+        scores[user_id] = {"name": user.full_name, "score": 0}
 
-app = ApplicationBuilder().token(TOKEN).build()
-app.add_handler(CommandHandler("start", start))
-app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, welcome))
-app.add_handler(MessageHandler(filters.ALL & (~filters.COMMAND), restrict_media))
+    scores[user_id]["name"] = user.full_name  # обновление имени
+    scores[user_id]["score"] += 1
+    save_scores()
 
-if __name__ == '__main__':
-    print("Бот запущен...")
+# Команда /топ
+async def top_scores(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    sorted_users = sorted(scores.items(), key=lambda x: x[1]["score"], reverse=True)
+    top_text = "🏆 Топ участников:\n\n"
+
+    for i, (user_id, data) in enumerate(sorted_users[:10], 1):
+        top_text += f"{i}. {data['name']} — {data['score']} баллов\n"
+
+    await update.message.reply_text(top_text)
+
+# Запуск бота
+if __name__ == "__main__":
+    app = ApplicationBuilder().token(TOKEN).build()
+
+    app.add_handler(CommandHandler("топ", top_scores))
+    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
+
+    print("Бот запущен.")
     app.run_polling()
