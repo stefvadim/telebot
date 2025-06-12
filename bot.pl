@@ -17,7 +17,8 @@ async def welcome(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = member.id
         join_times[chat_id][user_id] = datetime.utcnow()
         msg = await update.effective_chat.send_message(
-            f"Добро пожаловать, {member.mention_html()}!\nВ первые 24 часа нельзя отправлять фото, видео и ссылки.",
+            f"Добро пожаловать, {member.mention_html()}!\n"
+            "В первые 24 часа нельзя отправлять фото, видео и ссылки.",
             parse_mode="HTML",
         )
         await asyncio.sleep(10)
@@ -75,13 +76,6 @@ async def cmd_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     await update.message.reply_text(f"ID этого чата: {chat_id}")
 
-async def start_scheduler(app):
-    scheduler = AsyncIOScheduler()
-    # Передаем контекст с ботом через app.job_queue
-    scheduler.add_job(weekly_awards, "cron", day_of_week="mon", hour=0, minute=0, args=[app.job_queue])
-    scheduler.start()
-    print("Scheduler started")
-
 async def main():
     app = ApplicationBuilder().token(TOKEN).build()
 
@@ -90,10 +84,15 @@ async def main():
     app.add_handler(MessageHandler(filters.TEXT & (~filters.StatusUpdate.NEW_CHAT_MEMBERS), count_message))
     app.add_handler(CommandHandler("id", cmd_id))
 
-    # Запускаем планировщик после запуска event loop
-    asyncio.create_task(start_scheduler(app))
+    scheduler = AsyncIOScheduler()
+    scheduler.add_job(weekly_awards, "cron", day_of_week="mon", hour=0, minute=0, args=[app.job_queue])
+    scheduler.start()
 
+    # Запускаем polling без asyncio.run, чтобы не создавать конфликт с loop
     await app.run_polling()
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    # Запуск без asyncio.run()
+    import asyncio
+    loop = asyncio.get_event_loop()
+    loop.run_until_complete(main())
