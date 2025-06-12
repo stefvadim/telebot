@@ -12,16 +12,12 @@ from telegram.ext import (
     filters,
 )
 
-# 🔐 Вставь свой токен
 TOKEN = "7854667217:AAEpFQNVBPR_E-eFVy_I6dVXXmVOzs7bitg"
 
-# 🧠 Хранилища данных
 join_times = defaultdict(dict)  # {chat_id: {user_id: join_time}}
 rating = defaultdict(lambda: defaultdict(int))  # {chat_id: {user_id: message_count}}
 last_week_winners = defaultdict(list)  # {chat_id: [(user_id, score), ...]}
 
-
-# 👋 Приветствие новых пользователей
 async def welcome(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for member in update.message.new_chat_members:
         chat_id = update.effective_chat.id
@@ -35,8 +31,6 @@ async def welcome(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await asyncio.sleep(10)
         await msg.delete()
 
-
-# 🚫 Ограничение медиа и ссылок
 async def check_media_restriction(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     chat_id = update.effective_chat.id
@@ -59,15 +53,19 @@ async def check_media_restriction(update: Update, context: ContextTypes.DEFAULT_
                 except Exception:
                     pass
 
-
-# 📈 Подсчёт сообщений
+# Подсчет любых сообщений, кроме служебных и команд
 async def count_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message is None:
+        return
+    if update.message.text and update.message.text.startswith('/'):
+        # Игнорируем команды
+        return
     user_id = update.effective_user.id
     chat_id = update.effective_chat.id
     rating[chat_id][user_id] += 1
+    # Для отладки:
+    print(f"Counted message from user {user_id} in chat {chat_id}: {rating[chat_id][user_id]}")
 
-
-# 🏆 Еженедельные награды
 async def weekly_awards(app):
     bot = app.bot
     for chat_id, users_scores in rating.items():
@@ -88,17 +86,13 @@ async def weekly_awards(app):
         try:
             await bot.pin_chat_message(chat_id, msg.message_id, disable_notification=True)
         except Exception:
-            pass  # если нет прав - просто пропускаем
+            pass
 
         rating[chat_id].clear()
 
-
-# 🔧 Команда /id
 async def cmd_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"ID этого чата: {update.effective_chat.id}")
 
-
-# 🔧 Команда /top — текущий топ 5 в чате
 async def cmd_top(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     users_scores = rating.get(chat_id, {})
@@ -123,8 +117,6 @@ async def cmd_top(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(text, parse_mode="HTML")
 
-
-# 🔧 Команда /myrank — рейтинг пользователя
 async def cmd_myrank(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     user_id = update.effective_user.id
@@ -144,32 +136,25 @@ async def cmd_myrank(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"✉️ Сообщений: {score}"
     )
 
-
-# 🚀 Главная асинхронная функция
 async def main():
     app = ApplicationBuilder().token(TOKEN).build()
 
-    # Обработчики
     app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, welcome))
     app.add_handler(MessageHandler(filters.ALL & ~filters.StatusUpdate.NEW_CHAT_MEMBERS, check_media_restriction))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, count_message))
+    app.add_handler(MessageHandler(~filters.COMMAND & filters.ALL, count_message))  # ловим все не команды
     app.add_handler(CommandHandler("id", cmd_id))
     app.add_handler(CommandHandler("top", cmd_top))
     app.add_handler(CommandHandler("myrank", cmd_myrank))
 
-    # Планировщик
     scheduler = AsyncIOScheduler()
     scheduler.add_job(weekly_awards, "cron", day_of_week="mon", hour=0, minute=0, args=[app])
     scheduler.start()
 
-    # Запуск приложения
     await app.initialize()
     await app.start()
     await app.updater.start_polling()
     print("Бот запущен.")
-    await asyncio.Event().wait()  # Бесконечное ожидание
+    await asyncio.Event().wait()
 
-
-# 🎯 Точка входа
 if __name__ == "__main__":
     asyncio.run(main())
