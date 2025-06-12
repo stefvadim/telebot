@@ -1,184 +1,134 @@
-import os
-import json
 import asyncio
 from datetime import datetime, timedelta
+from collections import defaultdict
+
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from telegram import Update, ChatPermissions
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
     MessageHandler,
-    ContextTypes,
     filters,
+    ContextTypes,
 )
 
-TOKEN = os.getenv("BOT_TOKEN")
-SCORE_FILE = "scores.json"
-NEW_USER_TIMEOUT_HOURS = 24
-GROUP_ID = -1001234567890  # Замени на свой ID
 
-scores = {}
-if os.path.exists(SCORE_FILE):
-    with open(SCORE_FILE, "r", encoding="utf-8") as f:
-        scores = json.load(f)
+TOKEN = "7854667217:AAEpFQNVBPR_E-eFVy_I6dVXXmVOzs7bitg"
 
-def save_scores():
-    with open(SCORE_FILE, "w", encoding="utf-8") as f:
-        json.dump(scores, f)
+# Словарь для хранения времени вступления пользователей {chat_id: {user_id: join_time}}
+join_times = defaultdict(dict)
 
-# Для хранения времени входа новых пользователей (user_id: datetime)
-new_users = {}
+# Рейтинг сообщений {chat_id: {user_id: count}}
+rating = defaultdict(lambda: defaultdict(int))
 
-pinned_message_id = None
+# Победители прошлой недели {chat_id: [(user_id, score), ...]}
+last_week_winners = defaultdict(list)
 
-async def welcome_and_restrict(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Приветствие и ограничение новых участников"""
+
+async def welcome(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Приветствие нового участника + запрет на медиа первые 24 часа
     for member in update.message.new_chat_members:
+        chat_id = update.effective_chat.id
         user_id = member.id
-        now = datetime.utcnow()
-        new_users[user_id] = now
+        join_times[chat_id][user_id] = datetime.utcnow()
 
-        # Ограничиваем пользователя: запрет на отправку медиа и ссылок первые 24 часа
-        permissions = ChatPermissions(
-            can_send_messages=True,
-            can_send_media_messages=False,
-            can_send_polls=False,
-            can_send_other_messages=False,
-            can_add_web_page_previews=False,
-            can_change_info=False,
-            can_invite_users=False,
-            can_pin_messages=False,
+        # Отправляем приветствие
+        msg = await update.effective_chat.send_message(
+            f"Добро пожаловать, {member.mention_html()}!\n"
+            "В первые 24 часа нельзя отправлять фото, видео и ссылки.",
+            parse_mode="HTML"
         )
-        try:
-            await context.bot.restrict_chat_member(
-                chat_id=update.effective_chat.id,
-                user_id=user_id,
-                permissions=permissions,
-                until_date=now + timedelta(hours=NEW_USER_TIMEOUT_HOURS)
-            )
-        except Exception as e:
-            print(f"Ошибка ограничения пользователя {user_id}: {e}")
-
-        # Приветственное сообщение
-        welcome_msg = await update.message.reply_text(
-            f"Добро пожаловать, {member.full_name}! "
-            f"Вам запрещено публиковать фото, видео и ссылки в течение 24 часов."
-        )
-
         # Удаляем приветствие через 10 секунд
         await asyncio.sleep(10)
-        try:
-            await welcome_msg.delete()
-        except Exception:
-            pass  # если удалить не удалось — не страшно
+        await msg.delete()
 
-async def check_and_restrict_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Запрет на медиа/ссылки для новых пользователей в первые 24 часа"""
-    user = update.message.from_user
-    user_id = user.id
+
+async def check_media_restriction(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
     chat_id = update.effective_chat.id
+    user_id = user.id
 
-    if user_id in new_users:
-        joined_at = new_users[user_id]
+    # Проверяем, сколько пользователь в чате
+    if user_id in join_times[chat_id]:
+        join_time = join_times[chat_id][user_id]
         now = datetime.utcnow()
-        if now - joined_at < timedelta(hours=NEW_USER_TIMEOUT_HOURS):
-            # Проверяем, есть ли медиа, ссылки или документы в сообщении
+
+        if now - join_time < timedelta(hours=24):
+            # Если отправлено фото, видео или ссылка — удаляем сообщение
             if (
-                update.message.photo or
-                update.message.video or
-                update.message.document or
-                update.message.audio or
-                update.message.voice or
-                update.message.video_note or
-                update.message.animation or
-                (update.message.entities and any(e.type in ["url", "text_link"] for e in update.message.entities))
+                update.message.photo
+                or update.message.video
+                or (update.message.entities and any(e.type in ["url", "text_link"] for e in update.message.entities))
             ):
                 try:
                     await update.message.delete()
-                    warning = await update.message.reply_text(
-                        f"{user.full_name}, вы не можете публиковать медиа и ссылки в первые 24 часа после вступления."
+                    await update.effective_chat.send_message(
+                        f"{user.mention_html()}, публикация медиа и ссылок запрещена первые 24 часа!",
+                        parse_mode="HTML",
+                        reply_to_message_id=update.message.message_id,
                     )
-                    await asyncio.sleep(5)
-                    await warning.delete()
-                except Exception:
+                except:
                     pass
-                return  # сообщение удалено, дальше не считаем баллы
+                return
 
-    # Если прошло 24 часа или пользователь не новый — считаем баллы
-    await handle_message(update, context)
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.message.from_user
-    user_id = str(user.id)
-    if user_id not in scores:
-        scores[user_id] = {"name": user.full_name, "score": 0}
-    scores[user_id]["name"] = user.full_name
-    scores[user_id]["score"] += 1
-    save_scores()
+async def count_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
 
-async def top_scores(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not scores:
-        await update.message.reply_text("Рейтинг пуст.")
-        return
-    sorted_users = sorted(scores.items(), key=lambda x: x[1]["score"], reverse=True)
-    text = "🏆 Топ участников:\n\n"
-    for i, (user_id, data) in enumerate(sorted_users[:10], 1):
-        text += f"{i}. {data['name']} — {data['score']} баллов\n"
-    await update.message.reply_text(text)
+    # Увеличиваем счетчик сообщений
+    rating[chat_id][user_id] += 1
 
-async def reset_weekly_scores(app):
-    global scores, pinned_message_id
-    if not scores:
-        return
-    sorted_users = sorted(scores.items(), key=lambda x: x[1]["score"], reverse=True)
-    text = "🏅 Итоги недели:\n\n"
-    titles = ["🥇 Звезда недели", "🥈 Активист", "🥉 Участник недели"]
-    for i, (user_id, data) in enumerate(sorted_users[:3], 0):
-        text += f"{titles[i]} — {data['name']} ({data['score']} баллов)\n"
-    text += "\nРейтинг сброшен. Начинаем новую неделю!"
 
-    try:
-        msg = await app.bot.send_message(chat_id=GROUP_ID, text=text)
-        if pinned_message_id:
+async def weekly_awards(context: ContextTypes.DEFAULT_TYPE):
+    # Раздаем награды и сбрасываем рейтинг
+    bot = context.bot
+    for chat_id, users_scores in rating.items():
+        # Сортируем по убыванию
+        sorted_scores = sorted(users_scores.items(), key=lambda x: x[1], reverse=True)
+        last_week_winners[chat_id] = sorted_scores[:5]  # топ 5
+
+        # Формируем текст с победителями
+        text = "<b>🏆 Победители прошлой недели:</b>\n\n"
+        medals = ["🥇", "🥈", "🥉", "🎖️", "🎖️"]
+        for i, (user_id, score) in enumerate(last_week_winners[chat_id]):
             try:
-                await app.bot.unpin_chat_message(chat_id=GROUP_ID, message_id=pinned_message_id)
-            except Exception:
-                pass
-        await app.bot.pin_chat_message(chat_id=GROUP_ID, message_id=msg.message_id)
-        pinned_message_id = msg.message_id
-    except Exception as e:
-        print(f"Ошибка при отправке или закреплении сообщения: {e}")
+                user = await bot.get_chat_member(chat_id, user_id)
+                name = user.user.full_name
+            except:
+                name = "Пользователь"
+            text += f"{medals[i]} {name} — {score} сообщений\n"
 
-    scores = {}
-    save_scores()
-    # Очистим список новых пользователей (т.к. рейтинг сброшен)
-    new_users.clear()
+        # Отправляем и закрепляем сообщение с наградами
+        msg = await bot.send_message(chat_id, text, parse_mode="HTML")
+        await bot.pin_chat_message(chat_id, msg.message_id, disable_notification=True)
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Привет! Я бот рейтинга. Пиши сообщения и набирай баллы!")
+        # Сбрасываем рейтинг
+        rating[chat_id].clear()
 
-async def chat_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat = update.effective_chat
-    await update.message.reply_text(f"ID этого чата: {chat.id}")
 
-def main():
+async def cmd_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    await update.message.reply_text(f"ID этого чата: {chat_id}")
+
+
+async def start_bot():
     app = ApplicationBuilder().token(TOKEN).build()
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("top", top_scores))
-    app.add_handler(CommandHandler("id", chat_id))
-    # Обработка новых участников
-    app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, welcome_and_restrict))
-    # Обработка сообщений с проверкой медиа у новых участников
-    app.add_handler(MessageHandler(filters.ALL & (~filters.COMMAND), check_and_restrict_media))
+    app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, welcome))
+
+    # Отслеживаем все сообщения для подсчёта рейтинга и проверки медиа
+    app.add_handler(MessageHandler(filters.ALL & (~filters.StatusUpdate.NEW_CHAT_MEMBERS), check_media_restriction))
+    app.add_handler(MessageHandler(filters.TEXT & (~filters.StatusUpdate.NEW_CHAT_MEMBERS), count_message))
+
+    app.add_handler(CommandHandler("id", cmd_id))
 
     scheduler = AsyncIOScheduler()
-    scheduler.add_job(lambda: app.create_task(reset_weekly_scores(app)),
-                      trigger="cron", day_of_week="sat", hour=23, minute=59)
+    scheduler.add_job(weekly_awards, "cron", day_of_week="mon", hour=0, minute=0, args=[app.job_queue])
     scheduler.start()
 
-    print("Бот запущен.")
-    app.run_polling()
+    await app.run_polling()
+
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(start_bot())
