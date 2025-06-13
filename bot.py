@@ -5,7 +5,7 @@ from collections import defaultdict
 
 from fastapi import FastAPI, Request
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from telegram import Update, ChatMember
+from telegram import Update, ChatPermissions, ChatMember
 from telegram.ext import (
     ApplicationBuilder,
     ContextTypes,
@@ -14,6 +14,7 @@ from telegram.ext import (
     filters,
 )
 
+# === Настройки окружения ===
 TOKEN = os.getenv("BOT_TOKEN")
 RENDER_HOSTNAME = os.getenv("RENDER_EXTERNAL_HOSTNAME")
 WEBHOOK_PATH = "/webhook"
@@ -22,13 +23,14 @@ WEBHOOK_URL = f"https://{RENDER_HOSTNAME}{WEBHOOK_PATH}"
 telegram_app = ApplicationBuilder().token(TOKEN).build()
 app = FastAPI()
 
-join_times = defaultdict(dict)  # chat_id -> user_id -> join_time
+# === Хранилища данных ===
+join_times = defaultdict(dict)  # chat_id -> user_id -> datetime
 rating = defaultdict(lambda: defaultdict(int))  # chat_id -> user_id -> score
-last_week_winners = defaultdict(list)
-user_message_times = defaultdict(lambda: defaultdict(list))  # chat_id -> user_id -> [timestamps]
+message_log = defaultdict(lambda: defaultdict(list))  # chat_id -> user_id -> [datetime]
 muted_users = defaultdict(set)  # chat_id -> set(user_id)
+last_week_winners = defaultdict(list)
 
-# === Приветствие ===
+# === Приветствие новых участников ===
 async def welcome(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for member in update.message.new_chat_members:
         chat_id = update.effective_chat.id
@@ -42,64 +44,45 @@ async def welcome(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await asyncio.sleep(3)
         await msg.delete()
 
-# === Обработка сообщений ===
+# === Проверка на администратора ===
+async def is_admin(bot, chat_id, user_id):
+    try:
+        member = await bot.get_chat_member(chat_id, user_id)
+        return member.status in [ChatMember.ADMINISTRATOR, ChatMember.OWNER]
+    except:
+        return False
+
+# === Обработка всех сообщений ===
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     user_id = update.effective_user.id
+    now = datetime.utcnow()
     msg = update.message
 
-    # Админ проверка
-    member = await context.bot.get_chat_member(chat_id, user_id)
-    is_admin = member.status in [ChatMember.ADMINISTRATOR, ChatMember.OWNER]
+    if not msg:
+        return
 
-    # Проверка мута
-    if user_id in muted_users[chat_id] and not is_admin:
+    # Пропуск админов
+    if await is_admin(context.bot, chat_id, user_id):
+        return
+
+    # Если пользователь в муте — удаляем сообщение
+    if user_id in muted_users[chat_id]:
         try:
             await msg.delete()
         except:
             pass
         return
 
-    now = datetime.utcnow()
-
-    # Ограничение для новичков
-    if user_id in join_times[chat_id]:
-        joined_at = join_times[chat_id][user_id]
-        if now - joined_at < timedelta(hours=24):
-            if msg.photo or msg.video or msg.document or msg.audio or msg.video_note or msg.animation \
-                or any(e.type in ["url", "text_link"] for e in msg.entities or []):
-                try:
-                    await msg.delete()
-                    warn = await msg.reply_text(
-                        f"{msg.from_user.mention_html()}, медиа и ссылки запрещены первые 24 часа!",
-                        parse_mode="HTML"
-                    )
-                    await asyncio.sleep(3)
-                    await warn.delete()
-                except:
-                    pass
-                return
-
-    # === Подсчёт сообщений (включая медиа) ===
-    rating[chat_id][user_id] += 1
-
-    # === Антиспам ===
-    if not is_admin:
-        user_message_times[chat_id][user_id] = [
-            t for t in user_message_times[chat_id][user_id] if (now - t).seconds < 60
-        ]
-        user_message_times[chat_id][user_id].append(now)
-
-        if len(user_message_times[chat_id][user_id]) > 3:
-            muted_users[chat_id].add(user_id)
+    # Проверка новичка на медиа и ссылки
+    joined_at = join_times[chat_id].get(user_id)
+    if joined_at and now - joined_at < timedelta(hours=24):
+        if msg.photo or msg.video or msg.document or msg.audio or msg.video_note or msg.animation or \
+           any(e.type in ["url", "text_link"] for e in msg.entities or []):
             try:
-                await context.bot.restrict_chat_member(
-                    chat_id, user_id,
-                    permissions={"can_send_messages": False},
-                    until_date=int((now + timedelta(hours=1)).timestamp())
-                )
+                await msg.delete()
                 warn = await msg.reply_text(
-                    f"🔇 {msg.from_user.mention_html()} замьючен за флуд на 1 час.",
+                    f"{msg.from_user.mention_html()}, медиа и ссылки запрещены первые 24 часа!",
                     parse_mode="HTML"
                 )
                 await asyncio.sleep(3)
@@ -108,15 +91,42 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 pass
             return
 
-# === /top команда ===
+    # Считаем сообщение (флуд или нет)
+    rating[chat_id][user_id] += 1
+
+    # === Антиспам: 3 сообщения в минуту ===
+    message_log[chat_id][user_id] = [
+        t for t in message_log[chat_id][user_id] if (now - t).total_seconds() < 60
+    ]
+    message_log[chat_id][user_id].append(now)
+
+    if len(message_log[chat_id][user_id]) > 3:
+        muted_users[chat_id].add(user_id)
+        try:
+            await context.bot.restrict_chat_member(
+                chat_id,
+                user_id,
+                permissions=ChatPermissions(can_send_messages=False),
+                until_date=int((now + timedelta(hours=1)).timestamp())
+            )
+            warn = await msg.reply_text(
+                f"🔇 {msg.from_user.mention_html()} замьючен за флуд на 1 час.",
+                parse_mode="HTML"
+            )
+            await asyncio.sleep(3)
+            await warn.delete()
+        except:
+            pass
+
+# === /top ===
 async def cmd_top(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    users = rating.get(chat_id, {})
-    if not users:
-        await delete_after_reply(update, "Пока нет активных пользователей.")
+    top = sorted(rating[chat_id].items(), key=lambda x: x[1], reverse=True)[:5]
+
+    if not top:
+        await delete_reply(update, "Пока нет активных пользователей.")
         return
 
-    top = sorted(users.items(), key=lambda x: x[1], reverse=True)[:5]
     medals = ["🥇", "🥈", "🥉", "🎖️", "🎖️"]
     text = "<b>📊 Топ-5 участников:</b>\n\n"
     for i, (uid, score) in enumerate(top):
@@ -127,38 +137,40 @@ async def cmd_top(update: Update, context: ContextTypes.DEFAULT_TYPE):
             name = "Пользователь"
         text += f"{medals[i]} {name} — {score} сообщений\n"
 
-    await delete_after_reply(update, text, parse_mode="HTML")
+    await delete_reply(update, text, parse_mode="HTML")
 
-# === /myrank команда ===
+# === /myrank ===
 async def cmd_myrank(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     user_id = update.effective_user.id
-    users = rating.get(chat_id, {})
+    users = rating[chat_id]
+
     if user_id not in users:
-        await delete_after_reply(update, "Вы ещё не оставили ни одного сообщения.")
+        await delete_reply(update, "Вы ещё не оставили ни одного сообщения.")
         return
+
     sorted_users = sorted(users.items(), key=lambda x: x[1], reverse=True)
-    position = next((i + 1 for i, (uid, _) in enumerate(sorted_users) if uid == user_id), None)
+    rank = next((i + 1 for i, (uid, _) in enumerate(sorted_users) if uid == user_id), None)
     score = users[user_id]
-    await delete_after_reply(update, f"🏅 Ваше место: {position}\n✉️ Сообщений: {score}")
+    await delete_reply(update, f"🏅 Ваше место: {rank}\n✉️ Сообщений: {score}")
 
 # === /id (только админы) ===
 async def cmd_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     user_id = update.effective_user.id
-    member = await context.bot.get_chat_member(chat_id, user_id)
-    if member.status not in [ChatMember.ADMINISTRATOR, ChatMember.OWNER]:
+
+    if not await is_admin(context.bot, chat_id, user_id):
         return
+
     await update.message.reply_text(f"🆔 Chat ID: {chat_id}")
 
-# === /unmute <user_id> ===
+# === /unmute <user_id> (только админы) ===
 async def cmd_unmute(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    from_id = update.effective_user.id
-    member = await context.bot.get_chat_member(chat_id, from_id)
+    sender_id = update.effective_user.id
 
-    if member.status not in [ChatMember.ADMINISTRATOR, ChatMember.OWNER]:
-        await update.message.reply_text("❌ Команда доступна только админам.")
+    if not await is_admin(context.bot, chat_id, sender_id):
+        await update.message.reply_text("❌ Команда доступна только администраторам.")
         return
 
     if not context.args:
@@ -169,25 +181,37 @@ async def cmd_unmute(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = int(context.args[0])
         muted_users[chat_id].discard(user_id)
         await context.bot.restrict_chat_member(
-            chat_id, user_id,
-            permissions={"can_send_messages": True}
+            chat_id,
+            user_id,
+            permissions=ChatPermissions(can_send_messages=True)
         )
         await update.message.reply_text(f"✅ Пользователь {user_id} размьючен.")
     except Exception as e:
         await update.message.reply_text(f"Ошибка: {e}")
 
-# === Автонаграды ===
+# === Удалить ответ и запрос через 3 секунды ===
+async def delete_reply(update: Update, text: str, parse_mode=None):
+    try:
+        msg = await update.message.reply_text(text, parse_mode=parse_mode)
+        await asyncio.sleep(3)
+        await update.message.delete()
+        await msg.delete()
+    except:
+        pass
+
+# === Награждение недели ===
 async def weekly_awards(app):
     bot = app.bot
     for chat_id, scores in rating.items():
-        top_users = sorted(scores.items(), key=lambda x: x[1], reverse=True)[:5]
-        last_week_winners[chat_id] = top_users
+        top = sorted(scores.items(), key=lambda x: x[1], reverse=True)[:5]
+        last_week_winners[chat_id] = top
+        rating[chat_id].clear()
 
         text = "<b>🏆 Победители недели:</b>\n\n"
         medals = ["🥇", "🥈", "🥉", "🎖️", "🎖️"]
-        for i, (user_id, score) in enumerate(top_users):
+        for i, (uid, score) in enumerate(top):
             try:
-                member = await bot.get_chat_member(chat_id, user_id)
+                member = await bot.get_chat_member(chat_id, uid)
                 name = member.user.full_name
             except:
                 name = "Пользователь"
@@ -198,19 +222,8 @@ async def weekly_awards(app):
             await bot.pin_chat_message(chat_id, msg.message_id, disable_notification=True)
         except:
             pass
-        rating[chat_id].clear()
 
-# === Вспомогательная функция ===
-async def delete_after_reply(update: Update, text: str, parse_mode=None):
-    try:
-        msg = await update.message.reply_text(text, parse_mode=parse_mode)
-        await asyncio.sleep(3)
-        await update.message.delete()
-        await msg.delete()
-    except:
-        pass
-
-# === Хендлеры ===
+# === Handlers ===
 telegram_app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, welcome))
 telegram_app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_message))
 telegram_app.add_handler(CommandHandler("top", cmd_top))
@@ -218,7 +231,7 @@ telegram_app.add_handler(CommandHandler("myrank", cmd_myrank))
 telegram_app.add_handler(CommandHandler("id", cmd_id))
 telegram_app.add_handler(CommandHandler("unmute", cmd_unmute))
 
-# === Webhook ===
+# === Webhook endpoint ===
 @app.post(WEBHOOK_PATH)
 async def telegram_webhook(request: Request):
     data = await request.json()
@@ -236,6 +249,7 @@ async def on_startup():
     scheduler.start()
     print(f"✅ Webhook установлен: {WEBHOOK_URL}")
 
+# === Запуск локально ===
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("bot:app", host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
