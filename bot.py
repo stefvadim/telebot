@@ -13,21 +13,24 @@ from telegram.ext import (
     MessageHandler,
     filters,
 )
-import os
-TOKEN = os.getenv("BOT_TOKEN")  # Бери токен из переменной окружения
+
+# Конфигурация
+TOKEN = os.getenv("BOT_TOKEN")  # Токен из переменных окружения
+RENDER_HOSTNAME = os.getenv("RENDER_EXTERNAL_HOSTNAME")  # Используется Render
 WEBHOOK_PATH = "/webhook"
-WEBHOOK_URL = f"https://{os.getenv('RENDER_EXTERNAL_HOSTNAME')}{WEBHOOK_PATH}"
+WEBHOOK_URL = f"https://{RENDER_HOSTNAME}{WEBHOOK_PATH}"
 
 # Инициализация хранилищ
 join_times = defaultdict(dict)
 rating = defaultdict(lambda: defaultdict(int))
 last_week_winners = defaultdict(list)
 
-# Бот-приложение
+# Инициализация FastAPI и Telegram Application
 app = FastAPI()
 telegram_app = ApplicationBuilder().token(TOKEN).build()
 
-# Хендлеры
+# === Хендлеры ===
+
 async def welcome(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for member in update.message.new_chat_members:
         chat_id = update.effective_chat.id
@@ -141,7 +144,7 @@ async def cmd_myrank(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"✉️ Сообщений: {score}"
     )
 
-# Регистрируем хендлеры
+# === Регистрация хендлеров ===
 telegram_app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, welcome))
 telegram_app.add_handler(MessageHandler(filters.ALL & ~filters.StatusUpdate.NEW_CHAT_MEMBERS, check_media_restriction))
 telegram_app.add_handler(MessageHandler(~filters.COMMAND & filters.ALL, count_message))
@@ -149,7 +152,7 @@ telegram_app.add_handler(CommandHandler("id", cmd_id))
 telegram_app.add_handler(CommandHandler("top", cmd_top))
 telegram_app.add_handler(CommandHandler("myrank", cmd_myrank))
 
-# Webhook endpoint
+# === Webhook endpoint ===
 @app.post(WEBHOOK_PATH)
 async def telegram_webhook(req: Request):
     data = await req.json()
@@ -157,25 +160,20 @@ async def telegram_webhook(req: Request):
     await telegram_app.process_update(update)
     return {"ok": True}
 
-# При старте приложения
+# === Запуск при старте приложения ===
 @app.on_event("startup")
-async def on_startup():
-    await telegram_app.initialize()
-    await telegram_app.bot.set_webhook(WEBHOOK_URL)
-    await telegram_app.start()
-    scheduler = AsyncIOScheduler()
-    scheduler.add_job(weekly_awards, "cron", day_of_week="mon", hour=0, minute=0, args=[telegram_app])
-    scheduler.start()
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run("bot:app", host="0.0.0.0", port=10000)
-    @app.on_event("startup")
 async def on_startup():
     print("🔁 Starting up...")
     await telegram_app.initialize()
     await telegram_app.bot.set_webhook(WEBHOOK_URL)
     await telegram_app.start()
+
     scheduler = AsyncIOScheduler()
     scheduler.add_job(weekly_awards, "cron", day_of_week="mon", hour=0, minute=0, args=[telegram_app])
     scheduler.start()
     print("✅ Webhook установлен:", WEBHOOK_URL)
+
+# === Запуск локально (опционально) ===
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("bot:app", host="0.0.0.0", port=10000)
