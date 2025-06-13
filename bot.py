@@ -1,7 +1,9 @@
+import os
 import asyncio
 from datetime import datetime, timedelta
 from collections import defaultdict
 
+from fastapi import FastAPI, Request
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from telegram import Update
 from telegram.ext import (
@@ -12,12 +14,20 @@ from telegram.ext import (
     filters,
 )
 
-TOKEN = "7854667217:AAEpFQNVBPR_E-eFVy_I6dVXXmVOzs7bitg"
+TOKEN = os.getenv("BOT_TOKEN")  # Бери токен из переменной окружения
+WEBHOOK_PATH = "/webhook"
+WEBHOOK_URL = f"https://{os.getenv('RENDER_EXTERNAL_HOSTNAME')}{WEBHOOK_PATH}"
 
-join_times = defaultdict(dict)  # {chat_id: {user_id: join_time}}
-rating = defaultdict(lambda: defaultdict(int))  # {chat_id: {user_id: message_count}}
-last_week_winners = defaultdict(list)  # {chat_id: [(user_id, score), ...]}
+# Инициализация хранилищ
+join_times = defaultdict(dict)
+rating = defaultdict(lambda: defaultdict(int))
+last_week_winners = defaultdict(list)
 
+# Бот-приложение
+app = FastAPI()
+telegram_app = ApplicationBuilder().token(TOKEN).build()
+
+# Хендлеры
 async def welcome(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for member in update.message.new_chat_members:
         chat_id = update.effective_chat.id
@@ -53,18 +63,14 @@ async def check_media_restriction(update: Update, context: ContextTypes.DEFAULT_
                 except Exception:
                     pass
 
-# Подсчет любых сообщений, кроме служебных и команд
 async def count_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message is None:
         return
     if update.message.text and update.message.text.startswith('/'):
-        # Игнорируем команды
         return
     user_id = update.effective_user.id
     chat_id = update.effective_chat.id
     rating[chat_id][user_id] += 1
-    # Для отладки:
-    print(f"Counted message from user {user_id} in chat {chat_id}: {rating[chat_id][user_id]}")
 
 async def weekly_awards(app):
     bot = app.bot
@@ -120,7 +126,6 @@ async def cmd_top(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_myrank(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     user_id = update.effective_user.id
-
     users_scores = rating.get(chat_id, {})
     if not users_scores or user_id not in users_scores:
         await update.message.reply_text("Вы ещё не оставили ни одного сообщения.")
@@ -136,25 +141,28 @@ async def cmd_myrank(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"✉️ Сообщений: {score}"
     )
 
-async def main():
-    app = ApplicationBuilder().token(TOKEN).build()
+# Регистрируем хендлеры
+telegram_app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, welcome))
+telegram_app.add_handler(MessageHandler(filters.ALL & ~filters.StatusUpdate.NEW_CHAT_MEMBERS, check_media_restriction))
+telegram_app.add_handler(MessageHandler(~filters.COMMAND & filters.ALL, count_message))
+telegram_app.add_handler(CommandHandler("id", cmd_id))
+telegram_app.add_handler(CommandHandler("top", cmd_top))
+telegram_app.add_handler(CommandHandler("myrank", cmd_myrank))
 
-    app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, welcome))
-    app.add_handler(MessageHandler(filters.ALL & ~filters.StatusUpdate.NEW_CHAT_MEMBERS, check_media_restriction))
-    app.add_handler(MessageHandler(~filters.COMMAND & filters.ALL, count_message))  # ловим все не команды
-    app.add_handler(CommandHandler("id", cmd_id))
-    app.add_handler(CommandHandler("top", cmd_top))
-    app.add_handler(CommandHandler("myrank", cmd_myrank))
+# Webhook endpoint
+@app.post(WEBHOOK_PATH)
+async def telegram_webhook(req: Request):
+    data = await req.json()
+    update = Update.de_json(data, telegram_app.bot)
+    await telegram_app.process_update(update)
+    return {"ok": True}
 
+# При старте приложения
+@app.on_event("startup")
+async def on_startup():
+    await telegram_app.initialize()
+    await telegram_app.bot.set_webhook(WEBHOOK_URL)
+    await telegram_app.start()
     scheduler = AsyncIOScheduler()
-    scheduler.add_job(weekly_awards, "cron", day_of_week="mon", hour=0, minute=0, args=[app])
+    scheduler.add_job(weekly_awards, "cron", day_of_week="mon", hour=0, minute=0, args=[telegram_app])
     scheduler.start()
-
-    await app.initialize()
-    await app.start()
-    await app.updater.start_polling()
-    print("Бот запущен.")
-    await asyncio.Event().wait()
-
-if __name__ == "__main__":
-    asyncio.run(main())
