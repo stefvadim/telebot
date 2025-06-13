@@ -1,11 +1,11 @@
 import os
 import asyncio
 from datetime import datetime, timedelta
-from collections import defaultdict
+from collections import defaultdict, deque
 
 from fastapi import FastAPI, Request
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from telegram import Update, ChatMember
+from telegram import Update, ChatPermissions
 from telegram.ext import (
     ApplicationBuilder,
     ContextTypes,
@@ -14,25 +14,34 @@ from telegram.ext import (
     filters,
 )
 
-# === Конфигурация ===
+# Конфигурация
 TOKEN = os.getenv("BOT_TOKEN")
 RENDER_HOSTNAME = os.getenv("RENDER_EXTERNAL_HOSTNAME")
 WEBHOOK_PATH = "/webhook"
 WEBHOOK_URL = f"https://{RENDER_HOSTNAME}{WEBHOOK_PATH}"
 
-# === Telegram Application ===
+# Telegram Application
 telegram_app = ApplicationBuilder().token(TOKEN).build()
 
-# === FastAPI app ===
+# FastAPI app
 app = FastAPI()
 
-# === Данные ===
-join_times = defaultdict(dict)  # chat_id -> user_id -> join_time
-rating = defaultdict(lambda: defaultdict(int))  # chat_id -> user_id -> score
-last_week_winners = defaultdict(list)  # chat_id -> [(user_id, score)]
+# Хранилище данных
+join_times = defaultdict(dict)  # {chat_id: {user_id: join_time}}
+rating = defaultdict(lambda: defaultdict(int))  # {chat_id: {user_id: message_count}}
+last_week_winners = defaultdict(list)  # {chat_id: [(user_id, count)]}
+message_logs = defaultdict(lambda: defaultdict(deque))  # {chat_id: {user_id: deque of timestamps}}
+muted_users = defaultdict(set)  # {chat_id: set(user_ids)}
 
+# Проверка, является ли пользователь админом
+async def is_admin(bot, chat_id, user_id):
+    try:
+        member = await bot.get_chat_member(chat_id, user_id)
+        return member.status in ["administrator", "creator"]
+    except:
+        return False
 
-# === Приветствие новых пользователей ===
+# Приветствие
 async def welcome(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for member in update.message.new_chat_members:
         chat_id = update.effective_chat.id
@@ -41,52 +50,88 @@ async def welcome(update: Update, context: ContextTypes.DEFAULT_TYPE):
         msg = await update.effective_chat.send_message(
             f"Добро пожаловать, {member.mention_html()}!\n"
             "В первые 24 часа нельзя отправлять фото, видео и ссылки.",
-            parse_mode="HTML",
+            parse_mode="HTML"
         )
         await asyncio.sleep(10)
         await msg.delete()
 
-
-# === Ограничение на медиа и подсчёт сообщений ===
-async def media_restrict_and_count(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# Ограничение медиа
+async def check_media_restriction(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     user_id = update.effective_user.id
-    msg = update.message
-
-    # Проверка на ограничение
+    if await is_admin(context.bot, chat_id, user_id):
+        return
     if user_id in join_times[chat_id]:
         if datetime.utcnow() - join_times[chat_id][user_id] < timedelta(hours=24):
+            msg = update.message
             if msg.photo or msg.video or any(e.type in ["url", "text_link"] for e in msg.entities or []):
                 try:
                     await msg.delete()
                     await update.effective_chat.send_message(
                         f"{update.effective_user.mention_html()}, медиа и ссылки запрещены первые 24 часа!",
                         parse_mode="HTML",
-                        reply_to_message_id=msg.message_id,
+                        reply_to_message_id=msg.message_id
                     )
                 except:
                     pass
-                return  # если удалено — не считать
 
-    # Подсчёт сообщений
-    if msg and msg.text and not msg.text.startswith("/"):
-        rating[chat_id][user_id] += 1
-
-
-# === Команда /id — только для админов ===
-async def cmd_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# Антиспам
+async def antispam_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     user_id = update.effective_user.id
-    member = await context.bot.get_chat_member(chat_id, user_id)
-
-    if member.status not in [ChatMember.ADMINISTRATOR, ChatMember.OWNER]:
-        await update.message.reply_text("Команда доступна только администраторам.")
+    if await is_admin(context.bot, chat_id, user_id):
         return
 
-    await update.message.reply_text(f"ID этого чата: {chat_id}")
+    now = datetime.utcnow()
+    logs = message_logs[chat_id][user_id]
+    logs.append(now)
+    while logs and (now - logs[0]) > timedelta(minutes=1):
+        logs.popleft()
 
+    if len(logs) > 3 and user_id not in muted_users[chat_id]:
+        await context.bot.restrict_chat_member(
+            chat_id,
+            user_id,
+            permissions=ChatPermissions(can_send_messages=False),
+            until_date=now + timedelta(hours=1)
+        )
+        muted_users[chat_id].add(user_id)
+        await update.effective_chat.send_message(
+            f"{update.effective_user.mention_html()} был заглушен на 1 час за спам.",
+            parse_mode="HTML"
+        )
 
-# === Команда /top — топ 5 пользователей ===
+# Счётчик сообщений
+async def count_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message and not update.message.text.startswith("/"):
+        chat_id = update.effective_chat.id
+        user_id = update.effective_user.id
+        rating[chat_id][user_id] += 1
+
+# Команда /unmute (только для админов)
+async def cmd_unmute(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_admin(context.bot, update.effective_chat.id, update.effective_user.id):
+        return
+
+    if not context.args:
+        await update.message.reply_text("Укажите ID пользователя или ответьте на его сообщение.")
+        return
+
+    try:
+        user_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("Неверный формат ID.")
+        return
+
+    chat_id = update.effective_chat.id
+    try:
+        await context.bot.restrict_chat_member(chat_id, user_id, permissions=ChatPermissions(can_send_messages=True))
+        muted_users[chat_id].discard(user_id)
+        await update.message.reply_text(f"Пользователь {user_id} размьючен.")
+    except Exception as e:
+        await update.message.reply_text(f"Ошибка: {e}")
+
+# Команда /top
 async def cmd_top(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     users = rating.get(chat_id, {})
@@ -106,8 +151,7 @@ async def cmd_top(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text += f"{medals[i]} {name} — {score} сообщений\n"
     await update.message.reply_text(text, parse_mode="HTML")
 
-
-# === Команда /myrank — позиция пользователя ===
+# Команда /myrank
 async def cmd_myrank(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     user_id = update.effective_user.id
@@ -122,8 +166,14 @@ async def cmd_myrank(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Ваш рейтинг в этом чате:\n🏅 Место: {position}\n✉️ Сообщений: {score}"
     )
 
+# Команда /id (только для админов)
+async def cmd_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await is_admin(context.bot, update.effective_chat.id, update.effective_user.id):
+        await update.message.reply_text(f"ID этого чата: {update.effective_chat.id}")
+    else:
+        await update.message.reply_text("Эта команда доступна только администраторам.")
 
-# === Еженедельное награждение ===
+# Еженедельные награды
 async def weekly_awards(app):
     bot = app.bot
     for chat_id, scores in rating.items():
@@ -147,16 +197,7 @@ async def weekly_awards(app):
             pass
         rating[chat_id].clear()
 
-
-# === Регистрируем хендлеры ===
-telegram_app.add_handler(CommandHandler("id", cmd_id))
-telegram_app.add_handler(CommandHandler("top", cmd_top))
-telegram_app.add_handler(CommandHandler("myrank", cmd_myrank))
-telegram_app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, welcome))
-telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, media_restrict_and_count))
-
-
-# === Webhook endpoint ===
+# Webhook endpoint
 @app.post(WEBHOOK_PATH)
 async def telegram_webhook(request: Request):
     data = await request.json()
@@ -164,8 +205,7 @@ async def telegram_webhook(request: Request):
     await telegram_app.process_update(update)
     return {"ok": True}
 
-
-# === При старте FastAPI ===
+# При запуске
 @app.on_event("startup")
 async def on_startup():
     await telegram_app.initialize()
@@ -176,8 +216,17 @@ async def on_startup():
     scheduler.start()
     print(f"✅ Webhook установлен: {WEBHOOK_URL}")
 
+# Регистрируем хендлеры
+telegram_app.add_handler(CommandHandler("id", cmd_id))
+telegram_app.add_handler(CommandHandler("top", cmd_top))
+telegram_app.add_handler(CommandHandler("myrank", cmd_myrank))
+telegram_app.add_handler(CommandHandler("unmute", cmd_unmute))
+telegram_app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, welcome))
+telegram_app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, check_media_restriction))
+telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, antispam_check))
+telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, count_message))
 
-# === Запуск локального сервера ===
+# Запуск
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("bot:app", host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
