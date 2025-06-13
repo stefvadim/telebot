@@ -166,3 +166,16 @@ async def on_startup():
     scheduler = AsyncIOScheduler()
     scheduler.add_job(weekly_awards, "cron", day_of_week="mon", hour=0, minute=0, args=[telegram_app])
     scheduler.start()
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("bot:app", host="0.0.0.0", port=10000)
+    @app.on_event("startup")
+async def on_startup():
+    print("🔁 Starting up...")
+    await telegram_app.initialize()
+    await telegram_app.bot.set_webhook(WEBHOOK_URL)
+    await telegram_app.start()
+    scheduler = AsyncIOScheduler()
+    scheduler.add_job(weekly_awards, "cron", day_of_week="mon", hour=0, minute=0, args=[telegram_app])
+    scheduler.start()
+    print("✅ Webhook установлен:", WEBHOOK_URL)
