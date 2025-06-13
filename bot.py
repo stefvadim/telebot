@@ -149,9 +149,9 @@ async def cmd_myrank(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await reply.delete()
 
 # === Команда /unmute — только владелец ===
-async def cmd_unmute(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    user_id = update.effective_user.id
+async def is_owner(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: int) -> bool:
+    member = await context.bot.get_chat_member(chat_id, user_id)
+    return member.status == "creator"
 
     if not await is_owner(context, chat_id, user_id):
         await update.message.reply_text("🔒 Только владелец может использовать эту команду.")
