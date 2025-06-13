@@ -22,13 +22,12 @@ WEBHOOK_URL = f"https://{RENDER_HOSTNAME}{WEBHOOK_PATH}"
 telegram_app = ApplicationBuilder().token(TOKEN).build()
 app = FastAPI()
 
-# === DATA STRUCTURES ===
 join_times = defaultdict(dict)  # chat_id -> user_id -> join_time
-rating = defaultdict(lambda: defaultdict(int))  # chat_id -> user_id -> count
-muted_users = defaultdict(set)  # chat_id -> set(user_id)
+rating = defaultdict(lambda: defaultdict(int))  # chat_id -> user_id -> message count
+muted_users = defaultdict(set)  # chat_id -> set of muted user_ids
 user_msgs = defaultdict(lambda: defaultdict(deque))  # chat_id -> user_id -> deque[timestamps]
 
-# === GREETING ===
+
 async def welcome(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for member in update.message.new_chat_members:
         chat_id = update.effective_chat.id
@@ -43,21 +42,20 @@ async def welcome(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await asyncio.sleep(10)
         await msg.delete()
 
-# === ANTISPAM, MEDIA CHECK & RANKING ===
+
 async def process_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
     chat_id = update.effective_chat.id
     user_id = update.effective_user.id
     now = datetime.utcnow()
 
-    # Боты или мут? Удаляем
+    # Если пользователь в муте
     if user_id in muted_users[chat_id]:
         await msg.delete()
         return
 
-    # Проверка новых юзеров
-    if (user_id in join_times[chat_id] and
-        now - join_times[chat_id][user_id] < timedelta(hours=24)):
+    # Медиа и ссылки — запрещены новым
+    if user_id in join_times[chat_id] and now - join_times[chat_id][user_id] < timedelta(hours=24):
         if msg.photo or msg.video or msg.document or msg.sticker or \
            any(e.type in ["url", "text_link"] for e in msg.entities or []):
             try:
@@ -70,7 +68,7 @@ async def process_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 pass
             return
 
-    # Антиспам
+    # Антиспам: 3 сообщения в минуту
     timestamps = user_msgs[chat_id][user_id]
     timestamps.append(now)
     while timestamps and now - timestamps[0] > timedelta(minutes=1):
@@ -86,16 +84,16 @@ async def process_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             until_date=until
         )
         try:
-            await msg.reply_text("🔇 Вы были временно замучены за спам (1 час).")
+            await msg.reply_text("🔇 Вы были замучены за спам (на 1 час).")
         except:
             pass
         return
 
-    # Подсчет сообщений
+    # Подсчет сообщений (не команд)
     if msg.text and not msg.text.startswith("/"):
         rating[chat_id][user_id] += 1
 
-# === /top ===
+
 async def cmd_top(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     users = rating.get(chat_id, {})
@@ -118,7 +116,7 @@ async def cmd_top(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.delete()
     await reply.delete()
 
-# === /myrank ===
+
 async def cmd_myrank(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     user_id = update.effective_user.id
@@ -141,35 +139,39 @@ async def cmd_myrank(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.delete()
     await msg.delete()
 
-# === /unmute <id> ===
+
 async def cmd_unmute(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     user_id = update.effective_user.id
     sender = await context.bot.get_chat_member(chat_id, user_id)
 
-    if sender.status not in [ChatMember.ADMINISTRATOR, ChatMember.OWNER]:
-        return await update.message.reply_text("❌ Только для админов.")
+    if sender.status != ChatMember.OWNER:
+        return await update.message.reply_text("❌ Команда только для владельца чата.")
 
     if not context.args:
         return await update.message.reply_text("⚠️ Укажите ID пользователя: /unmute <user_id>")
 
-    target_id = int(context.args[0])
+    try:
+        target_id = int(context.args[0])
+    except ValueError:
+        return await update.message.reply_text("⚠️ Неверный формат ID.")
+
     muted_users[chat_id].discard(target_id)
     await context.bot.restrict_chat_member(chat_id, target_id, ChatPermissions(can_send_messages=True))
     await update.message.reply_text("✅ Пользователь размучен.")
 
-# === /id — только для админов ===
+
 async def cmd_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     user_id = update.effective_user.id
     member = await context.bot.get_chat_member(chat_id, user_id)
 
-    if member.status not in [ChatMember.ADMINISTRATOR, ChatMember.OWNER]:
-        return await update.message.reply_text("❌ Только для админов.")
+    if member.status != ChatMember.OWNER:
+        return await update.message.reply_text("❌ Команда только для владельца чата.")
 
     await update.message.reply_text(f"ID чата: {chat_id}")
 
-# === WEEKLY AWARDS ===
+
 async def weekly_awards(app):
     bot = app.bot
     for chat_id, users in rating.items():
@@ -192,7 +194,8 @@ async def weekly_awards(app):
 
         rating[chat_id].clear()
 
-# === REGISTER HANDLERS ===
+
+# === Handlers ===
 telegram_app.add_handler(CommandHandler("top", cmd_top))
 telegram_app.add_handler(CommandHandler("myrank", cmd_myrank))
 telegram_app.add_handler(CommandHandler("unmute", cmd_unmute))
@@ -200,13 +203,15 @@ telegram_app.add_handler(CommandHandler("id", cmd_id))
 telegram_app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, welcome))
 telegram_app.add_handler(MessageHandler(filters.ALL, process_message))
 
-# === WEBHOOK ===
+
+# === Webhook Endpoint ===
 @app.post(WEBHOOK_PATH)
 async def telegram_webhook(request: Request):
     data = await request.json()
     update = Update.de_json(data, telegram_app.bot)
     await telegram_app.process_update(update)
     return {"ok": True}
+
 
 @app.on_event("startup")
 async def startup():
@@ -218,7 +223,8 @@ async def startup():
     scheduler.start()
     print(f"✅ Webhook установлен: {WEBHOOK_URL}")
 
-# === LOCAL RUN ===
+
+# === Local run ===
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("bot:app", host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
