@@ -13,7 +13,7 @@ from telegram.ext import (
     MessageHandler,
     filters,
 )
-
+import os
 TOKEN = os.getenv("BOT_TOKEN")  # Бери токен из переменной окружения
 WEBHOOK_PATH = "/webhook"
 WEBHOOK_URL = f"https://{os.getenv('RENDER_EXTERNAL_HOSTNAME')}{WEBHOOK_PATH}"
