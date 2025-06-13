@@ -1,229 +1,205 @@
-import os
 import asyncio
 from datetime import datetime, timedelta
-from collections import defaultdict
+from collections import defaultdict, deque
 
-from fastapi import FastAPI, Request
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from telegram import Update, ChatPermissions
+from telegram import Update
 from telegram.ext import (
     ApplicationBuilder, ContextTypes,
     CommandHandler, MessageHandler, filters
 )
 
-# Конфигурация
-TOKEN = os.getenv("BOT_TOKEN")
-RENDER_HOSTNAME = os.getenv("RENDER_EXTERNAL_HOSTNAME")
-WEBHOOK_PATH = "/webhook"
-WEBHOOK_URL = f"https://{RENDER_HOSTNAME}{WEBHOOK_PATH}"
+TOKEN = "ВАШ_ТОКЕН_ОТСЮДА"
+SPAM_LIMIT = 3  # сообщений
+SPAM_INTERVAL = 60  # секунд
+MUTE_DURATION = 3600  # секунд (1 час)
 
-# Telegram Application
-telegram_app = ApplicationBuilder().token(TOKEN).build()
+# Хранилища данных
+join_times = defaultdict(dict)        # chat_id -> user_id -> join_datetime
+message_count = defaultdict(lambda: defaultdict(int))  # chat_id -> user_id -> count
+user_spam = defaultdict(lambda: defaultdict(deque))    # chat_id -> user_id -> deque of timestamps
+muted_until = defaultdict(dict)       # chat_id -> user_id -> mute_deadline
+weekly_winners = defaultdict(list)    # chat_id -> last week's winners
 
-# FastAPI
-app = FastAPI()
 
-# Хранилища
-join_times = defaultdict(dict)               # {chat_id: {user_id: join_time}}
-rating = defaultdict(lambda: defaultdict(int))  # {chat_id: {user_id: message_count}}
-message_times = defaultdict(lambda: defaultdict(list))  # {chat_id: {user_id: [timestamps]}}
-muted_users = defaultdict(dict)              # {chat_id: {user_id: mute_end_time}}
-last_week_winners = defaultdict(list)
+# Проверка — админ или владелец?
+async def is_admin(chat_id, user_id, bot):
+    try:
+        m = await bot.get_chat_member(chat_id, user_id)
+        return m.status in ("administrator", "creator")
+    except:
+        return False
 
-# Приветствие новых пользователей
-async def welcome(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    for member in update.message.new_chat_members:
-        chat_id = update.effective_chat.id
-        user_id = member.id
-        join_times[chat_id][user_id] = datetime.utcnow()
 
+# Приветствие + запрет медиа/ссылок
+async def welcome(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    for u in update.message.new_chat_members:
+        join_times[update.effective_chat.id][u.id] = datetime.utcnow()
         msg = await update.effective_chat.send_message(
-            f"👋 Добро пожаловать, {member.mention_html()}!\n"
-            "⛔ В течение 24 часов запрещены фото, видео и ссылки.",
+            f"Добро пожаловать, {u.mention_html()}!\nВ первые 24 ч запрещено публиковать медиа и ссылки.",
             parse_mode="HTML"
         )
-        await asyncio.sleep(10)
+        await asyncio.sleep(5)
         await msg.delete()
 
-# Ограничение медиа
-async def check_media_restriction(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    user_id = update.effective_user.id
-    if user_id in join_times[chat_id]:
-        if datetime.utcnow() - join_times[chat_id][user_id] < timedelta(hours=24):
-            msg = update.message
-            if msg.photo or msg.video or any(e.type in ["url", "text_link"] for e in msg.entities or []):
-                try:
-                    await msg.delete()
-                    await update.effective_chat.send_message(
-                        f"{update.effective_user.mention_html()}, медиа запрещены первые 24 часа!",
-                        parse_mode="HTML",
-                        reply_to_message_id=msg.message_id
-                    )
-                except:
-                    pass
 
-# Антиспам
-async def check_spam(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def check_new_restrictions(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     user = update.effective_user
     user_id = user.id
 
     if user_id in join_times[chat_id]:
-        # Получение админов
-        admins = await context.bot.get_chat_administrators(chat_id)
-        admin_ids = [a.user.id for a in admins]
-
-        if user_id not in admin_ids:
-            now = datetime.utcnow()
-            timestamps = message_times[chat_id][user_id]
-            timestamps = [t for t in timestamps if (now - t) < timedelta(minutes=1)]
-            timestamps.append(now)
-            message_times[chat_id][user_id] = timestamps
-
-            if len(timestamps) > 3 and user_id not in muted_users[chat_id]:
-                until = now + timedelta(hours=1)
+        if datetime.utcnow() - join_times[chat_id][user_id] < timedelta(hours=24):
+            m = update.message
+            if m.photo or m.video or any(e.type in ("url", "text_link") for e in (m.entities or [])):
                 try:
-                    await context.bot.restrict_chat_member(
-                        chat_id, user_id,
-                        permissions=ChatPermissions(can_send_messages=False),
-                        until_date=until
+                    await m.delete()
+                    msg = await update.effective_chat.send_message(
+                        f"{user.mention_html()}, нельзя публиковать медиа и ссылки первые 24 ч!",
+                        parse_mode="HTML",
+                        reply_to_message_id=m.message_id
                     )
-                    muted_users[chat_id][user_id] = until
-                    await update.effective_chat.send_message(
-                        f"🔇 {user.mention_html()} замучен на 1 час за спам.",
-                        parse_mode="HTML"
-                    )
-                except:
-                    pass
+                    await asyncio.sleep(3)
+                    await msg.delete()
+                except: pass
 
-# Подсчёт сообщений
-async def count_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.message and update.message.text and not update.message.text.startswith("/"):
-        chat_id = update.effective_chat.id
-        user_id = update.effective_user.id
-        rating[chat_id][user_id] += 1
 
-# Команды
-async def cmd_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    admins = await context.bot.get_chat_administrators(update.effective_chat.id)
-    if user_id in [a.user.id for a in admins]:
-        await update.message.reply_text(f"Chat ID: {update.effective_chat.id}")
-    else:
-        await update.message.reply_text("⛔ Только админы могут использовать эту команду.")
-
-async def cmd_top(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    users = rating.get(chat_id, {})
-    if not users:
-        await update.message.reply_text("Нет активных участников.")
+# Подсчет + антиспам + mute
+async def message_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    m = update.message
+    if not m or m.text and m.text.startswith("/"):
         return
-    top = sorted(users.items(), key=lambda x: x[1], reverse=True)[:5]
-    medals = ["🥇", "🥈", "🥉", "🎖️", "🎖️"]
-    text = "<b>📊 Топ-5 участников недели:</b>\n\n"
-    for i, (uid, score) in enumerate(top):
+
+    chat_id = update.effective_chat.id
+    user = update.effective_user
+    uid = user.id
+    bot = ctx.bot
+
+    # Админ не ограничен
+    if await is_admin(chat_id, uid, bot):
+        message_count[chat_id][uid] += 1
+        return
+
+    now = datetime.utcnow()
+
+    # Проверяем mute
+    until = muted_until[chat_id].get(uid)
+    if until and now < until:
         try:
-            member = await context.bot.get_chat_member(chat_id, uid)
-            name = member.user.full_name
-        except:
-            name = "Пользователь"
-        text += f"{medals[i]} {name} — {score} сообщений\n"
-    await update.message.reply_text(text, parse_mode="HTML")
+            await m.delete()
+        except: pass
+        return  # игнорим
 
-async def cmd_myrank(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    user_id = update.effective_user.id
-    users = rating.get(chat_id, {})
-    if user_id not in users:
-        await update.message.reply_text("Вы ещё не оставили ни одного сообщения.")
-        return
-    sorted_users = sorted(users.items(), key=lambda x: x[1], reverse=True)
-    position = next((i + 1 for i, (uid, _) in enumerate(sorted_users) if uid == user_id), None)
-    score = users[user_id]
-    await update.message.reply_text(
-        f"Ваш рейтинг:\n🏅 Место: {position}\n✉️ Сообщений: {score}"
-    )
+    # Антиспам: track timestamps
+    dq = user_spam[chat_id][uid]
+    dq.append(now)
+    while dq and (now - dq[0]).total_seconds() > SPAM_INTERVAL:
+        dq.popleft()
 
-async def cmd_unmute(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    admins = await context.bot.get_chat_administrators(chat_id)
-    admin_ids = [a.user.id for a in admins]
-
-    if update.effective_user.id not in admin_ids:
-        await update.message.reply_text("⛔ Только админы могут размутить участников.")
-        return
-
-    if not context.args:
-        await update.message.reply_text("Используйте: /unmute <user_id>")
-        return
-
-    try:
-        user_id = int(context.args[0])
-        await context.bot.restrict_chat_member(
-            chat_id, user_id,
-            permissions=ChatPermissions(can_send_messages=True)
+    if len(dq) > SPAM_LIMIT:
+        # мутим на час
+        muted_until[chat_id][uid] = now + timedelta(seconds=MUTE_DURATION)
+        user_spam[chat_id][uid].clear()
+        await ctx.bot.restrict_chat_member(
+            chat_id, uid,
+            permissions=...  # здесь указать ограничения: без отправки сообщений
         )
-        muted_users[chat_id].pop(user_id, None)
-        await update.message.reply_text(f"✅ Пользователь {user_id} размучен.")
-    except Exception as e:
-        await update.message.reply_text("Ошибка при размуте.")
+        await ctx.bot.send_message(chat_id, f"{user.mention_html()} замьючен за спам на час", parse_mode="HTML")
+        return
 
-# Еженедельный рейтинг
-async def weekly_awards(app):
-    bot = app.bot
-    for chat_id, scores in rating.items():
-        top_users = sorted(scores.items(), key=lambda x: x[1], reverse=True)[:5]
-        last_week_winners[chat_id] = top_users
+    # Подсчет сообщений
+    message_count[chat_id][uid] += 1
 
-        text = "<b>🏆 Победители недели:</b>\n\n"
-        medals = ["🥇", "🥈", "🥉", "🎖️", "🎖️"]
-        for i, (user_id, score) in enumerate(top_users):
-            try:
-                member = await bot.get_chat_member(chat_id, user_id)
-                name = member.user.full_name
-            except:
-                name = "Пользователь"
-            text += f"{medals[i]} {name} — {score} сообщений\n"
 
-        try:
-            msg = await bot.send_message(chat_id, text, parse_mode="HTML")
-            await bot.pin_chat_message(chat_id, msg.message_id, disable_notification=True)
-        except:
-            pass
+# Команда /top
+async def cmd_top(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    top5 = sorted(message_count[chat_id].items(), key=lambda x: x[1], reverse=True)[:5]
+    if not top5:
+        return await update.message.reply_text("Пока нет сообщений.")
+    txt = "📊 Текущий топ-5:\n"
+    medals = ["🥇","🥈","🥉","🎖️","🎖️"]
+    for i,(uid,cnt) in enumerate(top5):
+        name = (await ctx.bot.get_chat_member(chat_id, uid)).user.full_name
+        txt += f"{medals[i]} {name} — {cnt}\n"
+    msg = await update.message.reply_text(txt)
+    await asyncio.sleep(3); await msg.delete()
+    await asyncio.sleep(3); await update.message.delete()
 
-        rating[chat_id].clear()
 
-# Регистрируем хендлеры
-telegram_app.add_handler(CommandHandler("id", cmd_id))
-telegram_app.add_handler(CommandHandler("top", cmd_top))
-telegram_app.add_handler(CommandHandler("myrank", cmd_myrank))
-telegram_app.add_handler(CommandHandler("unmute", cmd_unmute))
-telegram_app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, welcome))
-telegram_app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, check_media_restriction))
-telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, check_spam))
-telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, count_message))
+# Команда /myrank
+async def cmd_myrank(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    uid = update.effective_user.id
+    ranklist = sorted(message_count[chat_id].items(), key=lambda x: x[1], reverse=True)
+    if uid not in dict(ranklist):
+        return await update.message.reply_text("У вас нет сообщений.")
+    position = next(i+1 for i,(u,_) in enumerate(ranklist) if u==uid)
+    score = message_count[chat_id][uid]
+    msg = await update.message.reply_text(f"Ваш ранг: {position}, сообщений: {score}")
+    await asyncio.sleep(3); await msg.delete()
+    await asyncio.sleep(3); await update.message.delete()
 
-# Webhook endpoint
-@app.post(WEBHOOK_PATH)
-async def telegram_webhook(request: Request):
-    data = await request.json()
-    update = Update.de_json(data, telegram_app.bot)
-    await telegram_app.process_update(update)
-    return {"ok": True}
 
-# Запуск
-@app.on_event("startup")
-async def on_startup():
-    await telegram_app.initialize()
-    await telegram_app.bot.set_webhook(WEBHOOK_URL)
-    await telegram_app.start()
-    scheduler = AsyncIOScheduler()
-    scheduler.add_job(weekly_awards, "cron", day_of_week="mon", hour=0, minute=0, args=[telegram_app])
-    scheduler.start()
-    print(f"✅ Webhook установлен: {WEBHOOK_URL}")
+# /id и /unmute только для админов
+async def cmd_id(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    uid = update.effective_user.id
+    if not await is_admin(chat_id, uid, ctx.bot):
+        return
+    await update.message.reply_text(f"Chat ID = {chat_id}")
 
-# Локальный запуск
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run("bot:app", host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
+async def cmd_unmute(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    uid_from = update.effective_user.id
+    if not await is_admin(chat_id, uid_from, ctx.bot):
+        return
+    parts = update.message.text.split()
+    if len(parts)!=2 or not parts[1].isdigit():
+        return await update.message.reply_text("Usage: /unmute <user_id>")
+    uid = int(parts[1])
+    if uid in muted_until[chat_id]:
+        muted_until[chat_id].pop(uid, None)
+        await ctx.bot.restrict_chat_member(
+            chat_id, uid,
+            permissions=None  # вернуть предыдущие права
+        )
+        await update.message.reply_text(f"User {uid} размьючен.")
+
+
+# Еженедельный отчет
+async def weekly_report(app):
+    for chat_id, scores in message_count.items():
+        leaderboard = sorted(scores.items(), key=lambda x: x[1], reverse=True)[:5]
+        if not leaderboard: continue
+        txt = "🏆 Победители недели:\n"
+        medals = ["🥇","🥈","🥉","🎖️","🎖️"]
+        for i,(uid,cnt) in enumerate(leaderboard):
+            name=(await app.bot.get_chat_member(chat_id,uid)).user.full_name
+            txt+= f"{medals[i]} {name} — {cnt}\n"
+        msg=await app.bot.send_message(chat_id, txt)
+        await app.bot.pin_chat_message(chat_id, msg.message_id)
+    message_count.clear()
+
+
+async def main():
+    app = ApplicationBuilder().token(TOKEN).build()
+
+    # Handler order: important!
+    app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, welcome))
+    app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, check_new_restrictions))
+    app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, message_handler))
+
+    app.add_handler(CommandHandler("top", cmd_top))
+    app.add_handler(CommandHandler("myrank", cmd_myrank))
+    app.add_handler(CommandHandler("id", cmd_id))
+    app.add_handler(CommandHandler("unmute", cmd_unmute))
+
+    from apscheduler.schedulers.asyncio import AsyncIOScheduler
+    sched = AsyncIOScheduler()
+    sched.add_job(weekly_report, "cron", day_of_week="mon", hour=0, minute=0, args=[app])
+    sched.start()
+
+    await app.run_polling()
+
+if __name__=="__main__":
+    asyncio.run(main())
