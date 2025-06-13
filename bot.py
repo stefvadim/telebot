@@ -31,7 +31,8 @@ join_times = defaultdict(dict)
 rating = defaultdict(lambda: defaultdict(int))
 last_week_winners = defaultdict(list)
 
-# Хендлеры
+# === Хендлеры ===
+
 async def welcome(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for member in update.message.new_chat_members:
         chat_id = update.effective_chat.id
@@ -93,7 +94,18 @@ async def weekly_awards(app):
         rating[chat_id].clear()
 
 async def cmd_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(f"ID этого чата: {update.effective_chat.id}")
+    chat_id = update.effective_chat.id
+    user_id = update.effective_user.id
+    try:
+        member = await context.bot.get_chat_member(chat_id, user_id)
+        if member.status not in ["administrator", "creator"]:
+            await update.message.reply_text("Эта команда доступна только администраторам.")
+            return
+    except:
+        await update.message.reply_text("Не удалось проверить статус администратора.")
+        return
+
+    await update.message.reply_text(f"ID этого чата: {chat_id}")
 
 async def cmd_top(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
@@ -128,15 +140,15 @@ async def cmd_myrank(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Ваш рейтинг в этом чате:\n🏅 Место: {position}\n✉️ Сообщений: {score}"
     )
 
-# Регистрируем хендлеры (в нужном порядке!)
+# === Регистрируем хендлеры ===
 telegram_app.add_handler(CommandHandler("id", cmd_id))
 telegram_app.add_handler(CommandHandler("top", cmd_top))
 telegram_app.add_handler(CommandHandler("myrank", cmd_myrank))
 telegram_app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, welcome))
 telegram_app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, check_media_restriction))
-telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, count_message))
+telegram_app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, count_message))
 
-# Webhook endpoint
+# === Webhook endpoint ===
 @app.post(WEBHOOK_PATH)
 async def telegram_webhook(request: Request):
     data = await request.json()
@@ -144,7 +156,7 @@ async def telegram_webhook(request: Request):
     await telegram_app.process_update(update)
     return {"ok": True}
 
-# При старте
+# === При старте ===
 @app.on_event("startup")
 async def on_startup():
     await telegram_app.initialize()
@@ -155,7 +167,7 @@ async def on_startup():
     scheduler.start()
     print(f"✅ Webhook установлен: {WEBHOOK_URL}")
 
-# Запуск
+# === Запуск сервера ===
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("bot:app", host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
